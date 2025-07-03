@@ -1,36 +1,92 @@
-#!/bin/bash
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-cd script_dir
+#!/usr/bin/env bash
+set -euo pipefail
 
-path=""
-route="mystream"
-port="8554"
+# resolve script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-while getopts ":p:" opt; do
-  case ${opt} in
-    p ) # Detect the -u (or -url) option
-      path=$OPTARG
-      shift
-      ;;
-    --route=* )
-      route = *
-      shift
-      ;;
-    --port=* )
-      port = *
-      shift
-      ;;
-    \? ) echo "Usage: cmd [-p] <path>"
+# defaults
+VIDEO_PATH=""
+ROUTE="mystream"
+PORT="8554"
+
+# parse options
+ARGS=$(getopt -o p: -l path:,route:,port: -n "$0" -- "$@")
+if [ $? -ne 0 ]; then
+  echo "Usage: $0 -p <path> [--route <route>] [--port <port>]" >&2
+  exit 1
+fi
+eval set -- "$ARGS"
+while true; do
+  case "$1" in
+    -p|--path)
+      VIDEO_PATH="$2"; shift 2 ;;
+    --route)
+      ROUTE="$2"; shift 2 ;;
+    --port)
+      PORT="$2"; shift 2 ;;
+    --)
+      shift; break ;;
+    *)
+      echo "Internal error parsing options" >&2
+      exit 1
       ;;
   esac
 done
 
-if [ -z "$path" ]; then
-  echo "No mp4 video provided. Usage: $0 -p <path>"
+# require video file
+if [[ -z "$VIDEO_PATH" ]]; then
+  echo "Error: no video provided."
+  echo "Usage: $0 -p <path> [--route <route>] [--port <port>]" >&2
   exit 1
 fi
 
-pkill -f "mediamtx"
-$script_dir/mediamtx $script_dir/mediamtx.yml  &
+# function to clean up MediaMTX on exit
+cleanup() {
+  pkill -f mediamtx || true
+}
+trap cleanup EXIT
 
-ffmpeg -re -stream_loop -1 -i $path -c:v libx264 -preset ultrafast -tune zerolatency -f rtsp -rtsp_transport tcp rtsp://localhost:${port}/${route}
+# kill any existing server
+pkill -f mediamtx || true
+
+# start MediaMTX
+"$SCRIPT_DIR/mediamtx" "$SCRIPT_DIR/mediamtx.yml" &
+MTX_PID=$!
+
+# wait for it to bind
+echo -n "Waiting for MediaMTX on port $PORT"
+for i in {1..20}; do
+  if nc -z localhost "$PORT"; then
+    echo " ✓"
+    break
+  else
+    echo -n .
+    sleep 0.25
+  fi
+  if [ $i -eq 20 ]; then
+    echo " failed to start on port $PORT" >&2
+    exit 1
+  fi
+done
+
+# choose encoder: prefer NVIDIA NVENC if available
+decoders_cmd="ffmpeg -hide_banner -encoders 2>/dev/null || true"
+if eval "$decoders_cmd" | grep -q "h264_nvenc"; then
+  export DRI_PRIME=1
+  echo "Using NVIDIA GPU encoder (h264_nvenc)"
+  # DEC_OPTS=( -hwaccel cuda -hwaccel_output_format cuda )
+  ENC_OPTS=( -c:v h264_nvenc -preset fast )
+else
+  echo "NVIDIA NVENC not available; falling back to software encoding (libx264)"
+  DEC_OPTS=()
+  ENC_OPTS=( -c:v libx264 -preset medium -tune zerolatency )
+fi
+
+# stream in a loop
+ffmpeg \
+  "${DEC_OPTS[@]}" \
+  -re -stream_loop -1 -i "$VIDEO_PATH" \
+  "${ENC_OPTS[@]}" \
+  -f rtsp \
+  "rtsp://localhost:${PORT}/${ROUTE}"
