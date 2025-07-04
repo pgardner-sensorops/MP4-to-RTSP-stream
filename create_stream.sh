@@ -9,6 +9,8 @@ cd "$SCRIPT_DIR"
 VIDEO_PATH=""
 ROUTE="mystream"
 PORT="8554"
+# always define DEC_OPTS to avoid unbound-variable under set -u
+DEC_OPTS=()
 
 # parse options
 ARGS=$(getopt -o p: -l path:,route:,port: -n "$0" -- "$@")
@@ -20,7 +22,7 @@ eval set -- "$ARGS"
 while true; do
   case "$1" in
     -p|--path)
-      VIDEO_PATH="$2"; shift 2 ;;
+      VIDEO_PATH="$2"; shift 2 ;; 
     --route)
       ROUTE="$2"; shift 2 ;;
     --port)
@@ -29,8 +31,7 @@ while true; do
       shift; break ;;
     *)
       echo "Internal error parsing options" >&2
-      exit 1
-      ;;
+      exit 1 ;;
   esac
 done
 
@@ -41,7 +42,7 @@ if [[ -z "$VIDEO_PATH" ]]; then
   exit 1
 fi
 
-# function to clean up MediaMTX on exit
+# cleanup MediaMTX on exit
 cleanup() {
   pkill -f mediamtx || true
 }
@@ -54,7 +55,7 @@ pkill -f mediamtx || true
 "$SCRIPT_DIR/mediamtx" "$SCRIPT_DIR/mediamtx.yml" &
 MTX_PID=$!
 
-# wait for it to bind
+# wait for binding
 echo -n "Waiting for MediaMTX on port $PORT"
 for i in {1..20}; do
   if nc -z localhost "$PORT"; then
@@ -70,23 +71,32 @@ for i in {1..20}; do
   fi
 done
 
-# choose encoder: prefer NVIDIA NVENC if available
+# choose encoder: prefer NVIDIA NVENC if available (no hardware decode)
 decoders_cmd="ffmpeg -hide_banner -encoders 2>/dev/null || true"
 if eval "$decoders_cmd" | grep -q "h264_nvenc"; then
-  export DRI_PRIME=1
   echo "Using NVIDIA GPU encoder (h264_nvenc)"
-  # DEC_OPTS=( -hwaccel cuda -hwaccel_output_format cuda )
   ENC_OPTS=( -c:v h264_nvenc -preset fast )
 else
-  echo "NVIDIA NVENC not available; falling back to software encoding (libx264)"
-  DEC_OPTS=()
+  echo "NVENC unavailable; falling back to software encoding (libx264)"
   ENC_OPTS=( -c:v libx264 -preset medium -tune zerolatency )
 fi
 
-# stream in a loop
+# path to a TrueType font for drawtext
+FONT=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+
+# build drawtext filter with strftime expansion and escaped colons
+TS_FILTER="drawtext=fontfile=${FONT}:\
+expansion=strftime:\
+fontcolor=white:fontsize=24:\
+box=1:boxcolor=black@0.5:\
+x=10:y=10:\
+text='%Y-%m-%d %H\:%M\:%S'"
+
+# stream in a loop with timestamp overlay
 ffmpeg \
   "${DEC_OPTS[@]}" \
   -re -stream_loop -1 -i "$VIDEO_PATH" \
+  -vf "$TS_FILTER" \
   "${ENC_OPTS[@]}" \
-  -f rtsp \
-  "rtsp://localhost:${PORT}/${ROUTE}"
+  -f rtsp "rtsp://localhost:${PORT}/${ROUTE}"
+
