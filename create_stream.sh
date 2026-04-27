@@ -6,26 +6,39 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # defaults
-VIDEO_PATH=""
-ROUTE="mystream"
 PORT="8554"
 USE_TIMESTAMP=0
-# always define DEC_OPTS to avoid unbound-variable under set -u
-DEC_OPTS=()
+
+# Collect video/route pairs.
+# Each -p adds a video; an optional --route after it names the stream.
+# Videos without an explicit --route get auto-named stream1, stream2, …
+VIDEO_PATHS=()
+ROUTES=()
 
 # parse options
-ARGS=$(getopt -o p: -l path:,route:,port:,timestamp -n "$0" -- "$@")
+ARGS=$(getopt -o p:t -l path:,route:,port:,timestamp -n "$0" -- "$@")
 if [ $? -ne 0 ]; then
-  echo "Usage: $0 -p <path> [--route <route>] [--port <port>] [--timestamp]" >&2
+  echo "Usage: $0 -p <path> [-p <path2> ...] [--route <route>] [--port <port>] [--timestamp]" >&2
+  echo "  Each --route applies to the preceding -p. Unrouted videos get stream1, stream2, …" >&2
   exit 1
 fi
 eval set -- "$ARGS"
+
 while true; do
   case "$1" in
     -p|--path)
-      VIDEO_PATH="$2"; shift 2 ;;
+      # If the previous video had a pending route override, it was already stored.
+      VIDEO_PATHS+=("$2")
+      ROUTES+=("")  # placeholder, may be overwritten by a following --route
+      shift 2 ;;
     --route)
-      ROUTE="$2"; shift 2 ;;
+      # Apply to the most recent -p
+      if [ ${#ROUTES[@]} -eq 0 ]; then
+        echo "Error: --route must follow a -p <path>" >&2
+        exit 1
+      fi
+      ROUTES[$(( ${#ROUTES[@]} - 1 ))]="$2"
+      shift 2 ;;
     --port)
       PORT="$2"; shift 2 ;;
     -t|--timestamp)
@@ -38,15 +51,28 @@ while true; do
   esac
 done
 
-# require video file
-if [[ -z "$VIDEO_PATH" ]]; then
+# require at least one video
+if [ ${#VIDEO_PATHS[@]} -eq 0 ]; then
   echo "Error: no video provided."
-  echo "Usage: $0 -p <path> [--route <route>] [--port <port>] [--timestamp]" >&2
+  echo "Usage: $0 -p <path> [-p <path2> ...] [--route <route>] [--port <port>] [--timestamp]" >&2
   exit 1
 fi
 
-# cleanup MediaMTX on exit
+# fill in default route names for any video that wasn't given one
+for i in "${!ROUTES[@]}"; do
+  if [ -z "${ROUTES[$i]}" ]; then
+    ROUTES[$i]="stream$(( i + 1 ))"
+  fi
+done
+
+# track ffmpeg child PIDs
+FFMPEG_PIDS=()
+
+# cleanup MediaMTX and all ffmpeg processes on exit
 cleanup() {
+  for pid in "${FFMPEG_PIDS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
   pkill -f mediamtx || true
 }
 trap cleanup EXIT
@@ -74,9 +100,8 @@ for i in {1..20}; do
   fi
 done
 
-# choose encoder: prefer NVIDIA NVENC if available (no hardware decode)
-decoders_cmd="ffmpeg -hide_banner -encoders 2>/dev/null || true"
-if eval "$decoders_cmd" | grep -q "h264_nvenc"; then
+# choose encoder: prefer NVIDIA NVENC if available
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "h264_nvenc"; then
   echo "Using NVIDIA GPU encoder (h264_nvenc)"
   ENC_OPTS=( -c:v h264_nvenc -preset fast )
 else
@@ -87,27 +112,36 @@ fi
 # optionally build timestamp filter
 FILTER_ARGS=()
 if [ "$USE_TIMESTAMP" -eq 1 ]; then
-  # path to a TrueType font for drawtext
   FONT=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
-
-  # build drawtext filter with strftime expansion and escaped colons
-TS_FILTER="drawtext=fontfile=${FONT}:\
+  TS_FILTER="drawtext=fontfile=${FONT}:\
 expansion=strftime:\
 fontcolor=white:fontsize=50:\
 box=1:boxcolor=black@0.5:\
 x=10:y=10:\
 text='%Y-%m-%d %H\\:%M\\:%S'"
-
   FILTER_ARGS=( -vf "$TS_FILTER" )
   echo "Timestamp overlay enabled."
 else
   echo "Streaming without timestamp overlay."
 fi
 
-# stream in a loop (conditionally with timestamp)
-ffmpeg \
-  "${DEC_OPTS[@]}" \
-  -re -stream_loop -1 -i "$VIDEO_PATH" \
-  "${FILTER_ARGS[@]}" \
-  "${ENC_OPTS[@]}" \
-  -f rtsp "rtsp://localhost:${PORT}/${ROUTE}"
+# launch one ffmpeg per video
+for i in "${!VIDEO_PATHS[@]}"; do
+  echo "Starting stream: rtsp://localhost:${PORT}/${ROUTES[$i]}  ←  ${VIDEO_PATHS[$i]}"
+  ffmpeg -hide_banner \
+    -re -stream_loop -1 -i "${VIDEO_PATHS[$i]}" \
+    "${FILTER_ARGS[@]}" \
+    "${ENC_OPTS[@]}" \
+    -f rtsp "rtsp://localhost:${PORT}/${ROUTES[$i]}" &
+  FFMPEG_PIDS+=($!)
+done
+
+echo ""
+echo "=== All streams running ==="
+for i in "${!VIDEO_PATHS[@]}"; do
+  echo "  rtsp://localhost:${PORT}/${ROUTES[$i]}"
+done
+echo "Press Ctrl+C to stop."
+
+# wait for any ffmpeg to exit (or Ctrl+C)
+wait -n "${FFMPEG_PIDS[@]}" 2>/dev/null || true

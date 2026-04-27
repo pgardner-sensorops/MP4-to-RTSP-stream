@@ -5,7 +5,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+source "$SCRIPT_DIR/menu.sh"
+
+
+
 # ---------- defaults ----------
+CUSTOM_DEVICE=0
 DEVICE="/dev/video0"
 WIDTH="1280"
 HEIGHT="720"
@@ -31,7 +36,7 @@ fi
 eval set -- "$ARGS"
 while true; do
   case "$1" in
-    -d|--device)      DEVICE="$2"; shift 2 ;;
+    -d|--device)      DEVICE="$2"; CUSTOM_DEVICE=1; shift 2 ;;
     --width)          WIDTH="$2"; shift 2 ;;
     --height)         HEIGHT="$2"; shift 2 ;;
     --fps)            FPS="$2"; shift 2 ;;
@@ -49,6 +54,40 @@ while true; do
     *) echo "Internal error parsing options" >&2; exit 1 ;;
   esac
 done
+
+# if custom device is 0, user did not specify a device. Check if /dev/video2 exists, otherwise use /dev/video0.
+
+
+if [ "$CUSTOM_DEVICE" -eq 0 ]; then
+  if [ -e /dev/video2 ]; then
+    # use menu to select device
+    echo "No device specified. Available video devices:"
+    #enumerate video devices
+    VIDEO_DEVICES=()
+    while IFS= read -r -d '' dev; do
+      VIDEO_DEVICES+=("$dev")
+    done < <(find /dev -maxdepth 1 -name 'video*' -print0)
+
+    # echo "Found video devices:"
+    # for i in "${!VIDEO_DEVICES[@]}"; do
+    #   echo "$i: ${VIDEO_DEVICES[i]}"
+    # done
+
+    DEVICE=$(menu_select "Select video device" "${VIDEO_DEVICES[@]}")
+
+    #check if user selected a valid device, if not, the DEVICE will be "Select video device"
+    if [[ "$DEVICE" == "Select video device" ]]; then
+      echo "No valid device selected. Exiting." >&2
+      exit 1
+    fi
+
+    # if user selected a device, set CUSTOM_DEVICE to 1
+    CUSTOM_DEVICE=1
+    echo "Using selected device: $DEVICE"
+  else
+    DEVICE="/dev/video0"
+  fi
+fi
 
 # cleanup MediaMTX on exit
 cleanup() {
@@ -80,7 +119,7 @@ for i in {1..20}; do
 done
 
 # pick encoder (NVENC if present)
-if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "h264_nvenc"; then
+if ffmpeg -hide_banner -encoders 2>/dev/null | grep "h264_nvenc" > /dev/null; then
   echo "Using NVIDIA GPU encoder (h264_nvenc)"
   ENC_OPTS=( -c:v h264_nvenc -preset "$NV_PRESET" -rc:v vbr -b:v "$BITRATE" -maxrate:v "$BITRATE" -bufsize:v "$BITRATE" )
 else
