@@ -100,15 +100,6 @@ for i in {1..20}; do
   fi
 done
 
-# choose encoder: prefer NVIDIA NVENC if available
-if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q "h264_nvenc"; then
-  echo "Using NVIDIA GPU encoder (h264_nvenc)"
-  ENC_OPTS=( -c:v h264_nvenc -preset fast )
-else
-  echo "NVENC unavailable; falling back to software encoding (libx264)"
-  ENC_OPTS=( -c:v libx264 -preset medium -tune zerolatency )
-fi
-
 # optionally build timestamp filter
 FILTER_ARGS=()
 if [ "$USE_TIMESTAMP" -eq 1 ]; then
@@ -125,14 +116,58 @@ else
   echo "Streaming without timestamp overlay."
 fi
 
+# choose codec path:
+#   no filter        -> stream copy (zero re-encode, perfect quality, low CPU)
+#   timestamp filter -> must re-encode; prefer NVENC, generous bitrate to avoid generational loss
+if [ "$USE_TIMESTAMP" -eq 0 ]; then
+  echo "Using stream copy (no re-encode)."
+  ENC_OPTS=( -c:v copy -c:a copy -bsf:v h264_mp4toannexb )
+elif ffmpeg -hide_banner -encoders 2>/dev/null | grep "h264_nvenc" >/dev/null; then
+  echo "Using NVIDIA GPU encoder (h264_nvenc) with timestamp overlay."
+  ENC_OPTS=(
+    -c:v h264_nvenc
+    -preset p5
+    -tune ll
+    -rc:v vbr
+    -cq:v 19
+    -b:v 0
+    -maxrate:v 30M
+    -bufsize:v 60M
+    -profile:v high
+    -pix_fmt yuv420p
+    -color_range tv
+    -g 60
+    -bf 0
+    -spatial-aq 1
+    -temporal-aq 1
+    -aq-strength 8
+  )
+else
+  echo "NVENC unavailable; falling back to software encoding (libx264) with timestamp overlay."
+  ENC_OPTS=(
+    -c:v libx264
+    -preset veryfast
+    -tune zerolatency
+    -profile:v high
+    -pix_fmt yuv420p
+    -g 60
+    -bf 0
+    -crf 18
+    -maxrate 30M
+    -bufsize 60M
+  )
+fi
+
 # launch one ffmpeg per video
 for i in "${!VIDEO_PATHS[@]}"; do
   echo "Starting stream: rtsp://localhost:${PORT}/${ROUTES[$i]}  ←  ${VIDEO_PATHS[$i]}"
   ffmpeg -hide_banner \
+    -fflags +genpts -avoid_negative_ts make_zero \
     -re -stream_loop -1 -i "${VIDEO_PATHS[$i]}" \
     "${FILTER_ARGS[@]}" \
     "${ENC_OPTS[@]}" \
-    -f rtsp "rtsp://localhost:${PORT}/${ROUTES[$i]}" &
+    -f rtsp -rtsp_transport tcp "rtsp://localhost:${PORT}/${ROUTES[$i]}" &
+    # -f rtsp "rtsp://localhost:${PORT}/${ROUTES[$i]}" &
   FFMPEG_PIDS+=($!)
 done
 

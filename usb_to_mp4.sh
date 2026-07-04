@@ -12,9 +12,9 @@ source "$SCRIPT_DIR/menu.sh"
 # ---------- defaults ----------
 CUSTOM_DEVICE=0
 DEVICE="/dev/video0"
-WIDTH="1280"
-HEIGHT="720"
-FPS="30"
+WIDTH="3264"
+HEIGHT="2448"
+FPS="15"
 INPUT_FORMAT="mjpeg"          # try: mjpeg | yuyv422 | h264
 ROUTE="mystream"
 PORT="8554"
@@ -152,6 +152,20 @@ fi
 
 # GOP
 GOP=$(( FPS * GOP_MULTIPLIER ))
+
+# view URLs (WebRTC/HLS ports read from mediamtx.yml; separate from RTSP --port)
+WEBRTC_PORT=$(grep -E '^webrtcAddress:' "$SCRIPT_DIR/mediamtx.yml" | awk -F: '{print $NF}')
+HLS_PORT=$(grep -E '^hlsAddress:' "$SCRIPT_DIR/mediamtx.yml" | awk -F: '{print $NF}')
+LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+echo
+echo "Stream '${ROUTE}' available at:"
+echo "  RTSP   (VLC/ffplay): rtsp://localhost:${PORT}/${ROUTE}"
+echo "  WebRTC (browser):    http://localhost:${WEBRTC_PORT}/${ROUTE}"
+echo "  HLS    (browser):    http://localhost:${HLS_PORT}/${ROUTE}"
+if [ -n "$LAN_IP" ]; then
+  echo "  From other devices on the LAN, replace 'localhost' with ${LAN_IP}"
+fi
+echo
 
 # publish to MediaMTX (no -rtsp_flags listen)
 ffmpeg -hide_banner \
